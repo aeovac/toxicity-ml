@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import numpy as np
 from numba import njit
 import sentencepiece
@@ -12,18 +12,21 @@ from dataclasses import dataclass, field
 from typing import List
 import os
 
-__labels__ = [
-    1, # Is toxic 
-    0 # Isn't
-]
+TOKENIZER_PATH = "tokenizer.model"
+MODEL_PATH = "model.pt"
+MAX_LEN = 128
+VOCAB_SIZE = 3000
+BATCH_SIZE = 32
+LR = 0.001
+EPOCHS = 10
 
 class Tokenizer(sentencepiece.SentencePieceProcessor):
-    def __init__(self, model_path="tokenizer.model"):
+    def __init__(self, model_path=TOKENIZER_PATH):
         super().__init__()
         self.Load(model_path)  # Load the pre-trained sentencepiece model
 
 @dataclass
-class TextDataset(Dataset):
+class TDataset(Dataset):
     texts: List[str]
     labels: List[int]
     tokenizer: Tokenizer
@@ -33,90 +36,121 @@ class TextDataset(Dataset):
         return len(self.texts)
     
     def __getitem__(self, idx):
-        text = self.texts[idx]
-        ids = self.tokenizer.EncodeAsIds(text)
-        padded = padd(
-            ids,
-            max_len=self.max_len,
-            text=text
-        )
-        
-        return (
-            padded,
-            torch.tensor(self.labels[idx], dtype=torch.float32)
-        )
+        text = str(self.texts[idx])
+        tokens = self.tokenizer.EncodeAsIds(text)
 
-def padd(ids, max_len, text, return_tensor=True):
-    ids = ids[:max_len]
-    padded = np.zeros(max_len, dtype=np.int64)
+        if len(tokens) < self.max_len:
+            tokens += [0] * (self.max_len - len(tokens))
+        else:
+            tokens = tokens[:self.max_len]
 
-    length = min(len(ids), max_len)
-    padded[:length] = ids
-    
-    if return_tensor:
-        padded = torch.from_numpy(padded)
+        return (torch.tensor(tokens), self.labels[idx])
 
-    return padded
+def get_data_loaders(df, tokenizer):
+    labels = df["label"]
+    counts = np.bincount(labels)
+    weights = 1. / counts[labels]
+
+    train_df, test_df = train_test_split(df, test_size=0.2)
+
+    train_df = train_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    def collate_fn(batch):
+        texts, labels = zip(*batch)
+
+        texts = [torch.tensor(text) for text in texts]
+        padded_texts = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0)
+        labels = torch.tensor(labels)
+        return padded_texts, labels
+
+    train_loader = DataLoader(
+        TDataset(train_df["text"].tolist(), train_df["label"].tolist(), tokenizer),
+        batch_size=BATCH_SIZE,
+        sampler=WeightedRandomSampler(weights[train_df["label"].values], len(train_df)),
+        collate_fn=collate_fn
+    )
+
+    test_loader = DataLoader(
+        TDataset(test_df["text"].tolist(), test_df["label"].tolist(), tokenizer),
+        batch_size=BATCH_SIZE,
+        sampler=WeightedRandomSampler(weights[test_df["label"].values], len(test_df)),
+        collate_fn=collate_fn
+    )
+
+    return (train_loader, test_loader)
 
 class Model(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self,vocab_size=VOCAB_SIZE):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, 128)
+        self.embedding = nn.Embedding(vocab_size, 128, padding_idx=0)
         self.lstm = nn.LSTM(128, 64, batch_first=True)
-        self.classifier = nn.Linear(64, 1)
-        self.sigmoid = nn.Sigmoid()
+        self.head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
         x = self.embedding(x)
         _, (hidden, _) = self.lstm(x)
-        return self.sigmoid(self.classifier(hidden[-1]))
+        return self.head(hidden[-1]).squeeze(1)
 
-def train():  
+def main():
     # Dataset from https://github.com/surge-ai/toxicity/
     df = pd.read_csv('data/dataset.csv')
+    df['label'] = df['is_toxic'].apply(lambda x: 1 if x == 'Toxic' else 0)
+    del df['is_toxic']
 
-    # Prepare the corpus file
-    input = 'data/corpus.txt'
-    with open(input, 'w', encoding='utf-8') as file:
-        file.write('\n'.join(df['text'].dropna().astype(str).tolist()))
+    if not os.path.exists(TOKENIZER_PATH):    
+        # Prepare the corpus file
+        input = 'data/corpus.txt'
+        with open(input, 'w', encoding='utf-8') as file:
+            file.write('\n'.join(df['text'].dropna().astype(str).tolist()))
 
-    # Train the tokenizer
-    sentencepiece.SentencePieceTrainer.Train(
-        input=input,
-        model_prefix='tokenizer',
-        vocab_size=3000,
-        character_coverage=1.0,
-        model_type='bpe',
-    )
+        sentencepiece.SentencePieceTrainer.Train(
+            input=input,
+            model_prefix='tokenizer',
+            vocab_size=VOCAB_SIZE,
+            model_type='bpe',
+        )
 
-    t = Tokenizer(model_path='tokenizer.model')
-
-    texts = df['text'].tolist()
-    labels = [1 if is_toxic == 'Toxic' else 0 for is_toxic in df['is_toxic'].astype(str).tolist()]
-
-    train_texts, test_texts, train_labels, test_labels = train_test_split(texts, labels, test_size=0.2)
-
-    # Train only
-    dataset = TextDataset(texts=train_texts, labels=train_labels, tokenizer=t, max_len=128)
-
-    model = Model(vocab_size=t.GetPieceSize())
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-    for _ in range(10):
-        for inputs, labels in dataloader:
-            optimizer.zero_grad()
-            outputs = model(inputs)
-
-    torch.save('model.pt')
-
-def predict(text):
     t = Tokenizer()
-    model = Model(vocab_size=t.GetPieceSize())
 
-    model.load_state_dict('model.pt')
-    model.eval()
+    train_loader, test_loader = get_data_loaders(df, t)
 
-    padd(text).unsqueeze
+    model = Model(t.GetPieceSize())
+
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    for _ in range(EPOCHS):
+        for inputs, labels in train_loader:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels.float())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+       
+    # Tests
+    for inputs, labels in test_loader:
+        print(labels.__int__())
+        outputs = model(inputs).item()
+        
+    torch.save(model.state_dict(), MODEL_PATH)
+
+if __name__ == "__main__":
+    main() # Entrainement
+
+    t = Tokenizer()
+    m = Model(t.GetPieceSize())
+    m.load_state_dict(torch.load(MODEL_PATH))
+
+    while True:
+        i = input("Your phrase here:")
+        tokens = t.EncodeAsIds(i)
+
+        tensor = torch.tensor(tokens).unsqueeze(0)
+
+        with torch.no_grad():
+            print(m(tensor).item())
